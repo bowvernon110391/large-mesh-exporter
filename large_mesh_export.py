@@ -49,11 +49,13 @@ class KDTreeNode:
         self.aabb = AABB()
         # default split is x axis
         self.axisId = 0 
-        # triangle data (id to vertex?)
+        # triangle data (LOOP TRIANGLES TO BE EXACT, from BLENDER MESH DATA)
         self.tris = []
         self.trisCenters = []
         # current depth?
         self.depth = 0
+        # which mesh object do we contain? -1 is invalid
+        self.object_id = -1
 
     def isRoot(self):
         return self.parent == None
@@ -75,6 +77,8 @@ class KDTreeNode:
 
         c1 = self.children[0]
         c2 = self.children[1]
+        c1.parent = self
+        c2.parent = self
         # copy parent aabb
         c1.aabb.min = list(self.aabb.min)
         c1.aabb.max = list(self.aabb.max)
@@ -125,21 +129,68 @@ class KDTreeNode:
 
     # debug print?
     def debugPrint(self):
-        print("Node[%d] @ depth(%d): tris(%d), aabb(%.4f %.4f %.4f | %.4f %.4f %.4f), leaf?(%s)\n" % (
+        print("Node[%d] @ depth(%d): tris(%d), aabb(%.4f %.4f %.4f | %.4f %.4f %.4f), leaf?(%s) --> mesh_id(%d)" % (
             self._id, self.depth, len(self.tris), 
             self.aabb.min[0], self.aabb.min[1], self.aabb.min[2],
             self.aabb.max[0], self.aabb.max[1], self.aabb.max[2],
-            ('False', 'True')[self.isLeaf()]
+            ('False', 'True')[self.isLeaf()], self.object_id
         ))
         # recurse if we have children
         if not self.isLeaf():
-            print("\tChildren: { %d, %d }\n" % (self.children[0]._id, self.children[1]._id))
+            print(" -- Children: { %d, %d }" % (self.children[0]._id, self.children[1]._id))
             self.children[0].debugPrint()
             self.children[1].debugPrint()
 
+# count nodes and renumber them
+def nodeCount(tree, renumber=True):
+    # use iterative method
+    stack = [tree]
+    count = 0
+
+    while len(stack):
+        tr = stack.pop()
+
+        if renumber:
+            tr._id = count
+
+        count += 1
+        if not tr.isLeaf():
+            stack.append(tr.children[0])
+            stack.append(tr.children[1])
+
+    return count
+
+
+# collect good leaves only, and set its object id
+def collectGoodLeaves(tree):
+    # use iterative method
+    stack = [tree]
+
+    goodOnes = []
+
+    # while stack not empty
+    while len(stack):
+        # pop one from stack
+        tr = stack.pop()
+        # is this one leaf?
+        if tr.isLeaf():
+            # do real check
+            if len(tr.tris):
+                # we do have data
+                goodOnes.append(tr)
+        else:
+            # just push children to stack
+            stack.append(tr.children[0])
+            stack.append(tr.children[1])
+    # by now, the good ones must have been filled. 
+    # now, we renumber em
+    for (idx, leaf) in enumerate(goodOnes):
+        leaf.object_id = idx
+    return goodOnes
+
 # helper to make a kdtree out of a mesh object?
 def buildTree(obj, maxDepth=10, maxTris=10000):
-    print("Building KDTree from object: %s, with max depth: %d, max tris: %d\n" % (obj.name, maxDepth, maxTris))
+    print("Building KDTree from object: %s, with max depth: %d, max tris: %d" % (obj.name, maxDepth, maxTris))
     # mesh = bpy.types.Mesh()
     mesh = obj.data
 
@@ -148,7 +199,7 @@ def buildTree(obj, maxDepth=10, maxTris=10000):
     mesh.calc_normals_split()
     mesh.calc_tangents()
 
-    print("Computing AABB from %d vertices...\n" % len(mesh.vertices))
+    print("Computing AABB from %d vertices..." % len(mesh.vertices))
 
     # spawn the root node
     root = KDTreeNode(0, maxDepth=maxDepth, maxTris=maxTris)
@@ -181,10 +232,11 @@ def buildTree(obj, maxDepth=10, maxTris=10000):
         t_center[1] /= 3.0
         t_center[2] /= 3.0
 
-        # now add em?
-        root.addTriangle(t_center, t_idx)
+        # now add em? ADD THE TRIANGLE DIRECTLY!!!!
+        root.addTriangle(t_center, t)
 
-    # return the root node
+    # return the root node, but renumber them first
+    nodeCount(root)
     return root
 # 
 
@@ -246,6 +298,90 @@ def bytesPerVertex(vtx_format):
 
     return totalSize
 ##
+
+# build mesh data from a single leafnode
+def buildSingleMeshFromLeafNode(obj, node, format=VTF_DEFAULT):
+    if not node.isLeaf():
+        return None
+    
+    # safe to go
+    mesh = obj.data
+    verts = mesh.vertices   # xyz 
+    loops = mesh.loops  # normal, tangent
+    uv0 = mesh.uv_layers[0].data    # uv0
+    uv1 = None  # uv1
+    if (len(mesh.uv_layers) > 1):
+        uv1 = mesh.uv_layers[1].data
+    
+    # init submeshes bucket?
+    submeshes = []
+    for i in range(len(mesh.materials)):
+        submeshes.append([])
+    
+    # to store our unique vertices
+    unique_verts = []
+    # now loop over our triangle loops
+    n = node
+
+    # for each triangleloop
+    for (t_id, t) in enumerate(n.tris):
+        newTriangle = []
+        # for each vertex on it
+        for i in range(3):
+            # compute vertex?
+            newVertex = []
+
+            if format & VTF_POS:
+                rp = verts[t.vertices[i]].co
+                pos = [rp.x, rp.z, -rp.y]
+                newVertex.append(pos)
+            
+            if format & VTF_NORMAL:
+                rn = loops[t.loops[i]].normal
+                normal = [rn.x, rn.z, -rn.y]
+                newVertex.append(normal)
+
+            if format & VTF_UV0:
+                uv = uv0[t.loops[i]].uv
+                newVertex.append([uv.x, uv.y])
+
+            if format & VTF_TANGENT_BITANGENT:
+                tgt = loops[t.loops[i]].tangent
+                btg = loops[t.loops[i]].bitangent
+                newVertex.append([
+                    tgt.x, tgt.z, -tgt.y,
+                    btg.x, btg.z, -btg.y
+                ])
+
+            if format & VTF_UV1:
+                # if we have no uv1 data, raise an exception
+                if not uv1:
+                    raise Exception("Fuck it no uv1 for this mesh, even if it's requested!")
+
+                uv = uv1[t.loops[i]].uv
+                newVertex.append([uv.x, uv.y])
+
+            # we got a vertex now, to lookup its index
+            if newVertex not in unique_verts:
+                unique_verts.append(newVertex)
+
+            newTriangle.append(unique_verts.index(newVertex))
+        
+        # got a new triangle, now append to submesh?
+        submeshes[t.material_index].append(newTriangle)
+
+    # return a tuple of a vertices and submeshes?
+    return (unique_verts, submeshes)
+
+# build meshes from tree
+def buildMeshesFromTree(obj, tree, format=VTF_DEFAULT):
+    leaves = collectGoodLeaves(tree)
+    meshes = []
+    for (idx, l) in enumerate(leaves):
+        m = buildSingleMeshFromLeafNode(obj, l, format)
+        meshes.append(m)
+        l.object_id = idx
+    return meshes
 
 ###
 # buildBuffers: return tuple of vb and ib
@@ -442,6 +578,106 @@ def can_write(context, vtx_format, me):
         return False
 
     return True
+
+def write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format):
+    f = open(filepath, mode="w", encoding="utf-8")
+
+    # first, write object name?
+    f.write("name: %s\n" % (obj.name))
+    # node count?
+    f.write("node_count: %d\n" % (nodeCount(tree, False)))
+    # mesh data?
+    f.write("mesh_obj_count: %d\n" % (len(meshes)))
+    # submesh count per mesh
+    f.write("submesh_per_obj: %d\n" % (len(obj.data.materials)))
+    # now write node data first?
+    # id, parent_id, bounding_box, mesh_id
+    # use iterative method
+    stack = [tree]
+
+    while len(stack):
+        node = stack.pop()
+
+        parent_id = -1
+        if node.parent:
+            parent_id = node.parent._id
+        self_id = node._id
+        aabb = node.aabb
+        mesh_id = node.object_id
+
+        # write it?
+        str = "node: id(%d), parent_id(%d), aabb(%.4f %.4f %.4f | %.4f %.4f %.4f) mesh_id(%d)\n" % (
+            self_id, parent_id, aabb.min[0], aabb.min[1], aabb.min[2], aabb.max[0], aabb.max[1], aabb.max[2],
+            mesh_id
+        )
+
+        f.write(str)
+
+        # if has children, add more
+        if not node.isLeaf():
+            stack.append(node.children[0])
+            stack.append(node.children[1])
+    # now we write mesh data!
+    for (m_id, m) in enumerate(meshes):
+        # write down unique vertices?
+        # m = (unique_verts[], submesh[])
+        str = "mesh[%d]: vert(%d) submesh(%d)\n" % (m_id, len(m[0]), len(m[1]))
+        f.write(str)
+        # write down vertices
+        for (v_id, v) in enumerate(m[0]):
+            str = "v[%d]:" % v_id
+            idx = 0
+            if vtx_format & VTF_POS:
+                str += " pos(%.4f %.4f %.4f)" % (v[idx][0], v[idx][1], v[idx][2])
+                idx += 1
+            if vtx_format & VTF_NORMAL:
+                str += " norm(%.4f %.4f %.4f)" % (v[idx][0], v[idx][1], v[idx][2])
+                idx += 1
+            if vtx_format & VTF_UV0:
+                str += " uv0(%.4f %.4f)" % (v[idx][0], v[idx][1])
+                idx += 1
+            if vtx_format & VTF_TANGENT_BITANGENT:
+                str += " tb(%.4f %.4f %.4f | %.4f %.4f %.4f)" % (
+                    v[idx][0], v[idx][1], v[idx][2],
+                    v[idx][3], v[idx][4], v[idx][5]
+                )
+                idx += 1
+            if vtx_format & VTF_UV1:
+                str += " uv1(%.4f %.4f)" % (v[idx][0], v[idx][1])
+            
+            str += "\n"
+            f.write(str)
+        # write submeshes data
+        for (sm_id, sm) in enumerate(m[1]):
+            f.write("-submesh[%d]: tris(%d)\n" % (sm_id, len(sm)))
+            for (t_id, t) in enumerate(sm):
+                f.write("--tri[%d]: %d %d %d\n" % (t_id, t[0], t[1], t[2]))
+
+    f.close()
+
+
+
+def do_write_tree(context, filepath, vtx_format, me, maxDepth, maxTris, mode="ascii"):
+    print("LMF_EXPORT_STARTED...")
+
+    if not can_write(context, vtx_format, me):
+        return {'CANCELLED'}
+
+    obj = context.selected_objects[0]
+
+    print("WRITING(%s), VTX_FORMAT(%d), MAX_DEPTH(%d), MAX_TRIS(%d), MODE(%s)" % (
+        filepath, vtx_format, maxDepth, maxTris, mode
+    ))
+    # build tree
+    tree = buildTree(obj, maxDepth=maxDepth, maxTris=maxTris)
+    meshes = buildMeshesFromTree(obj, tree, vtx_format)
+
+    write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format)
+
+    me.report({'INFO'}, "LARGE MESH FILE WRITTEN!")
+
+    return {'FINISHED'}
+
 
 # do the writing (easy)
 def do_write(context, filepath, vtx_format, me, mode="ascii"):
@@ -678,20 +914,20 @@ def write_to_ascii(filepath, vb, ibs, vtx_format, objname, bounding):
 # ExportHelper is a helper class, defines filename and
 # invoke() function which calls the file selector.
 from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy.types import Operator
 
 
 class LMFExporter(Operator, ExportHelper):
-    """Export to Bowie's Custom Format (BCF) ascii"""
+    """Export to Large Mesh Format (LMF)"""
     bl_idname = "lmf_exporter.export"  # important since its how bpy.ops.import_test.some_data is constructed
     bl_label = "EXPORT LARGE MESH!"
 
     # ExportHelper mixin class uses this
-    filename_ext = ".bcf"
+    filename_ext = ".lmf"
 
     filter_glob: StringProperty(
-        default="*.bcf",
+        default="*.lmf",
         options={'HIDDEN'},
         maxlen=255,  # Max internal buffer length, longer would be clamped.
     )
@@ -705,6 +941,9 @@ class LMFExporter(Operator, ExportHelper):
     vertex_has_color: BoolProperty(name="Color", description="(RGB) vertex color", default=(VTF_DEFAULT & VTF_COLOR)!=0)
     vertex_has_bone: BoolProperty(name="Bone Weights+IDs", description="Bone Weights + ID for skeletal animation", default=(VTF_DEFAULT & VTF_BONE_DATA)!=0)
     vertex_has_tween: BoolProperty(name="Tween", description="XYZ vertex animation data", default=(VTF_DEFAULT & VTF_TWEEN)!=0)
+
+    max_depth: IntProperty(name="Max Tree Depth", description="Maximum depth of the KD Tree", default=10, min=4, max=32)
+    max_tris: IntProperty(name="Max Triangles", description="Maximum triangle before splitting", default=1000, min=40)
 
     write_mode: EnumProperty(
         items=(
@@ -729,7 +968,8 @@ class LMFExporter(Operator, ExportHelper):
         if self.vertex_has_tween: format |= VTF_TWEEN
 
 
-        return do_write(context, self.filepath, format, self, self.write_mode)
+        # return do_write(context, self.filepath, format, self, self.write_mode)
+        return do_write_tree(context, self.filepath, format, self, self.max_depth, self.max_tris)
 
 
 # Only needed if you want to add into a dynamic menu
@@ -752,3 +992,29 @@ if __name__ == "__main__":
 
     # test call
     bpy.ops.lmf_exporter.export('INVOKE_DEFAULT')
+
+# def dump(obj):
+#    for attr in dir(obj):
+#        if hasattr( obj, attr ):
+#            print( "obj.%s = %s" % (attr, getattr(obj, attr)))
+
+# o = bpy.context.selected_objects[0]
+# t = buildTree(o, 10, 1000)
+# meshes = buildMeshesFromTree(o, t)
+
+# t.debugPrint()
+
+# for (idx, m) in enumerate(meshes):
+#     print("mesh[%d]: verts(%d), submesh(%d)" % (idx, len(m[0]), len(m[1])))
+#     # dump every vertices? nope, just the triangle for now I guess
+#     for (si, sm) in enumerate(m[1]):
+#         print("-- submesh[%d]: tris(%d)" % (si, len(sm)))
+#         for (ti, t) in enumerate(sm):
+#             print("  -- t(%d %d %d)" % (t[0], t[1], t[2]))
+# print("nodes count: %d" % (nodeCount(t)))
+
+# gl = collectGoodLeaves(t)
+# print("Collecting good leaves...got (%d)" % (len(gl)))
+
+
+# dump(meshes)
