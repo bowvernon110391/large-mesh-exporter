@@ -579,6 +579,7 @@ def can_write(context, vtx_format, me):
 
     return True
 
+# write tree in ascii format
 def write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format):
     f = open(filepath, mode="w", encoding="utf-8")
 
@@ -655,10 +656,110 @@ def write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format):
 
     f.close()
 
+# write the tree, but in binary file
+# 1b: vertex_format
+# 1b: bytes_per_vertex
+# 2b: node_count
+# 2b: mesh_obj_count
+# 2b: material_count (submeshes per mesh)
+# 32b: object_name
+# [node_count x 36b](nodes), which has: 
+# {
+#  - 4b: id
+#  - 4b: parent_id (-1 if no parent)
+#  - 24b: 6 float (aabb min - max)
+#  - 4b: mesh_object_id (-1 if no mesh_object)
+# }
+# [mesh_obj_count x (4b + material_count x 4b + bytes_per_vertex x vertex_count + triangle_count x 6b)](meshes), which has:
+# {
+#  - 4b: mesh_data_block_size (how many bytes until the end of this mesh, after this 4b here)
+#  - 2b: vertex_count
+#  - 2b: triangle_count
+#  - [material_count x 4b](submesh_data)
+#  - {
+#     - 2b: start_idx
+#     - 2b: num_elems -> triangle_count x 3
+#  - }
+#  - { vertex_buffers }
+#  - [triangle_count x 3 x 2b]{ index_buffers }
+# }
+def write_tree_to_binary(filepath, obj, tree, meshes, vtx_format):
+    f = open(filepath, mode="wb")
+
+    '''
+    'b'         signed integer     1
+    'B'         unsigned integer   1
+    'u'         Unicode character  2 (see note)
+    'h'         signed integer     2
+    'H'         unsigned integer   2
+    'i'         signed integer     2
+    'I'         unsigned integer   2
+    'l'         signed integer     4
+    'L'         unsigned integer   4
+    'q'         signed integer     8 (see note)
+    'Q'         unsigned integer   8 (see note)
+    'f'         floating point     4
+    'd'         floating point     8
+    '''
+    # 1b: vertex_format
+    f.write(make_buffer('B', [vtx_format]))
+    # 1b: bytes_per_vertex
+    vertex_size = bytesPerVertex(vtx_format)
+    f.write(make_buffer('B', [vertex_size]))
+    # 2b: node_count
+    f.write(make_buffer('H', [nodeCount(tree, False)]))
+    # 2b: mesh_object_count
+    f.write(make_buffer('H', [len(meshes)]))
+    # 2b: material_count
+    f.write(make_buffer('H', [len(obj.data.materials)]))
+    # 32b: object_name
+    buf = bytearray(obj.name, 'utf-8')
+    padded_buf = buf.ljust(32, b'\0')
+    f.write(padded_buf)
+
+    # (nodes)
+    # write iteratively, use stack
+    stack = [tree]
+
+    while len(stack):
+        node = stack.pop()
+
+        # process
+        # [node_count x 36b](nodes), which has: 
+        # {
+        #  - 4b: id
+        #  - 4b: parent_id (-1 if no parent)
+        #  - 24b: 6 float (aabb min - max)
+        #  - 4b: mesh_object_id (-1 if no mesh_object)
+        # }
+        # ----------------START-------------------------------
+        # 4b: id
+        # 4b: parent_id
+        id_parent_id = [ node._id, -1 ]
+        if node.parent:
+            id_parent_id[1] = node.parent._id
+        f.write(make_buffer('l', id_parent_id))
+
+        # 24b: 6 float
+        aabb = [node.aabb.min[0], node.aabb.min[1], node.aabb.min[2], node.aabb.max[0], node.aabb.max[1], node.aabb.max[2]]
+        f.write(make_buffer('f', aabb))
+
+        # 4b: mesh_object_id
+        f.write(make_buffer('l', [node.object_id]))
+
+        # add child if possible
+        if not node.isLeaf():
+            stack.append(node.children[0])
+            stack.append(node.children[1])
+
+    # meshes here... 
+    
+
+    f.close()
 
 
 def do_write_tree(context, filepath, vtx_format, me, maxDepth, maxTris, mode="ascii"):
-    print("LMF_EXPORT_STARTED...")
+    print("LMF_EXPORT_STARTED... mode = %s" % (mode))
 
     if not can_write(context, vtx_format, me):
         return {'CANCELLED'}
@@ -672,7 +773,10 @@ def do_write_tree(context, filepath, vtx_format, me, maxDepth, maxTris, mode="as
     tree = buildTree(obj, maxDepth=maxDepth, maxTris=maxTris)
     meshes = buildMeshesFromTree(obj, tree, vtx_format)
 
-    write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format)
+    if mode == "ascii":
+        write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format)
+    else:
+        write_tree_to_binary(filepath, obj, tree, meshes, vtx_format)
 
     me.report({'INFO'}, "LARGE MESH FILE WRITTEN!")
 
@@ -969,7 +1073,7 @@ class LMFExporter(Operator, ExportHelper):
 
 
         # return do_write(context, self.filepath, format, self, self.write_mode)
-        return do_write_tree(context, self.filepath, format, self, self.max_depth, self.max_tris)
+        return do_write_tree(context, self.filepath, format, self, self.max_depth, self.max_tris, self.write_mode)
 
 
 # Only needed if you want to add into a dynamic menu
