@@ -67,6 +67,7 @@ class KDTreeNode:
     def split(self):
         # ARE WE TOO DEEP? if so, do nothing
         if self.depth >= self._maxDepth:
+            print("split aborted on depth limit @ %d" % self.depth)
             return
 
         # okay, gotta spawn two children?
@@ -74,6 +75,7 @@ class KDTreeNode:
         self.children[1] = KDTreeNode(self._id * 2 + 2, self._maxDepth, self._maxTris)
         # compute the splitting axis
         self.axisId = self.aabb.findSplittingAxis()
+        print("splitting on axis_id = %d" % self.axisId)
 
         c1 = self.children[0]
         c2 = self.children[1]
@@ -116,6 +118,7 @@ class KDTreeNode:
 
             # are we over limit?
             if len(self.tris) > self._maxTris:
+                print("node split @ %d triangles" % len(self.tris))
                 self.split()
         else:
             # gotta recurse to child?
@@ -701,6 +704,7 @@ def write_tree_to_binary(filepath, obj, tree, meshes, vtx_format):
     'f'         floating point     4
     'd'         floating point     8
     '''
+    print("BINARY: writing header\n")
     # 1b: vertex_format
     f.write(make_buffer('B', [vtx_format]))
     # 1b: bytes_per_vertex
@@ -711,12 +715,14 @@ def write_tree_to_binary(filepath, obj, tree, meshes, vtx_format):
     # 2b: mesh_object_count
     f.write(make_buffer('H', [len(meshes)]))
     # 2b: material_count
-    f.write(make_buffer('H', [len(obj.data.materials)]))
+    material_count = len(obj.data.materials)
+    f.write(make_buffer('H', [material_count]))
     # 32b: object_name
     buf = bytearray(obj.name, 'utf-8')
     padded_buf = buf.ljust(32, b'\0')
     f.write(padded_buf)
 
+    print("BINARY: writing node data...\n")
     # (nodes)
     # write iteratively, use stack
     stack = [tree]
@@ -753,7 +759,93 @@ def write_tree_to_binary(filepath, obj, tree, meshes, vtx_format):
             stack.append(node.children[1])
 
     # meshes here... 
-    
+    # [mesh_obj_count x (4b + material_count x 4b + bytes_per_vertex x vertex_count + triangle_count x 6b)](meshes), which has:
+    # {
+    #  - 4b: mesh_data_block_size (how many bytes until the end of this mesh, after this 4b here)
+    #  - 2b: vertex_count
+    #  - 2b: triangle_count
+    #  - [material_count x 4b](submesh_data)
+    #  - {
+    #     - 2b: start_idx
+    #     - 2b: num_elems -> triangle_count x 3
+    #  - }
+    #  - { vertex_buffers }
+    #  - [triangle_count x 3 x 2b]{ index_buffers }
+    # }
+    print("BINARY: writing mesh data...\n")
+    # for each mesh
+    for (m_id, m) in enumerate(meshes):
+        print("BINARY: writing mesh[%d]\n" % m_id)
+        # compute mesh data block size
+        verts = m[0]
+        submeshes = m[1]
+
+        # compute vertex_count and triangle_count
+        vertex_count = len(verts)
+        triangle_count = 0
+        for (sm_id, sm) in enumerate(submeshes):
+            triangle_count += len(sm)
+
+        # the vertex_count + triangle_count
+        mesh_data_size = 4
+        # compute vertex buffer sizes
+        mesh_data_size += vertex_size * vertex_count
+        # add submeshes data (4b each)
+        mesh_data_size += material_count * 4
+        # add triangle data 
+        mesh_data_size += triangle_count * 6
+
+        # write it down?
+        # 4b: mesh_data_block_size
+        f.write(make_buffer('L', [mesh_data_size]))
+        # 2b: vertex_count
+        # 2b: triangle_count
+        f.write(make_buffer('H', [vertex_count, triangle_count]))
+
+        # write submesh data?
+        offset = 0
+        for (sm_id, sm) in enumerate(submeshes):
+            # 2b: start_idx (offset_byte)
+            # 2b: elem_count
+            elem_count = len(sm) * 3
+            f.write(make_buffer('H', [offset, elem_count]))
+            offset += elem_count * 2
+        
+        # write vertex buffer
+        for (v_id, v) in enumerate(verts):
+            # print("Writing vertex[%d]: " % v_id)
+            data_idx = 0
+
+            # pos
+            if vtx_format & VTF_POS:
+                # print(" pos(%.2f %.2f %.2f)" % (v[data_idx][0], v[data_idx][1], v[data_idx][2]))
+                f.write(make_buffer('f', v[data_idx]))
+                data_idx += 1
+
+            # normal
+            if vtx_format & VTF_NORMAL:
+                f.write(make_buffer('f', v[data_idx]))
+                data_idx += 1
+
+            # uv0
+            if vtx_format & VTF_UV0:
+                f.write(make_buffer('f', v[data_idx]))
+                data_idx += 1
+
+            # tangent, bit
+            if vtx_format & VTF_TANGENT_BITANGENT:
+                f.write(make_buffer('f', v[data_idx]))
+                data_idx += 1
+
+            # uv1
+            if vtx_format & VTF_UV1:
+                f.write(make_buffer('f', v[data_idx]))
+                data_idx += 1
+
+        # index buffer now
+        for (sm_id, sm) in enumerate(submeshes):
+            for (t_id, t) in enumerate(sm):
+                f.write(make_buffer('H', t))
 
     f.close()
 
