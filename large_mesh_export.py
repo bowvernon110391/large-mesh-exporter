@@ -11,6 +11,14 @@ class AABB:
             self.min = list(vectorInit)
             self.max = list(vectorInit)
 
+    # volume
+    def volume(self):
+        w = self.max[0] - self.min[0]
+        h = self.max[1] - self.min[1]
+        d = self.max[2] - self.min[2]
+        return w * h * d
+
+    # try to encase a single point
     def encase(self, v):
         self.min[0] = min(self.min[0], v[0])
         self.min[1] = min(self.min[1], v[1])
@@ -19,6 +27,16 @@ class AABB:
         self.max[0] = max(self.max[0], v[0])
         self.max[1] = max(self.max[1], v[1])
         self.max[2] = max(self.max[2], v[2])
+
+    # try to unionize with another aabb
+    def union(self, aabb):
+        self.min[0] = min(self.min[0], aabb.min[0])
+        self.min[1] = min(self.min[1], aabb.min[1])
+        self.min[2] = min(self.min[2], aabb.min[2])
+
+        self.max[0] = max(self.max[0], aabb.max[0])
+        self.max[1] = max(self.max[1], aabb.max[1])
+        self.max[2] = max(self.max[2], aabb.max[2])
 
     # find largest axis to split
     # 0=x, 1=y, 2=z
@@ -52,6 +70,7 @@ class KDTreeNode:
         # triangle data (LOOP TRIANGLES TO BE EXACT, from BLENDER MESH DATA)
         self.tris = []
         self.trisCenters = []
+        self.trisBBox = []
         # current depth?
         self.depth = 0
         # which mesh object do we contain? -1 is invalid
@@ -81,7 +100,10 @@ class KDTreeNode:
         c2 = self.children[1]
         c1.parent = self
         c2.parent = self
-        # copy parent aabb
+
+        c1.aabb = AABB()
+        c2.aabb = AABB()
+        # copy parent aabb (NOPE, DO NOT DO THAT)
         c1.aabb.min = list(self.aabb.min)
         c1.aabb.max = list(self.aabb.max)
         c2.aabb.min = list(self.aabb.min)
@@ -101,7 +123,8 @@ class KDTreeNode:
         for i in range(len(self.tris)):
             t = self.tris[i]
             tCenter = self.trisCenters[i]
-            self.addTriangle(tCenter, t)
+            bbox = self.trisBBox[i]
+            self.addTriangle(tCenter, t, bbox)
         
         # clear data
         self.tris = []
@@ -110,15 +133,24 @@ class KDTreeNode:
     # logic to add triangle indices data?
     # vCenter = triangle center?
     # indices = an array of 3 indices
-    def addTriangle(self, vCenter, indices):
+    # aabb = aabb of the triangle
+    def addTriangle(self, vCenter, indices, aabb):
         if self.isLeaf():
+            # # if it's the first triangle, set aabb to that triangle size
+            # if len(self.tris) == 0:
+            #     self.aabb.min = list(aabb.min)
+            #     self.aabb.max = list(aabb.max)
+            # else:
+            #     # try to encase the bbox
+            #     self.aabb.union(aabb)
             # we're leaf nodes, just add it?
             self.trisCenters.append(vCenter)
             self.tris.append(indices)
+            self.trisBBox.append(aabb)
 
             # are we over limit?
             if len(self.tris) > self._maxTris:
-                print("node split @ %d triangles" % len(self.tris))
+                print("node split @ %d triangles over limit %d, depth: %d" % (len(self.tris), self._maxTris, self.depth))
                 self.split()
         else:
             # gotta recurse to child?
@@ -128,7 +160,7 @@ class KDTreeNode:
             if vCenter[aId] > (0.5 * self.aabb.min[aId] + self.aabb.max[aId]):
                 cId = 1
             # got child id, recurse to em
-            self.children[cId].addTriangle(vCenter, indices)
+            self.children[cId].addTriangle(vCenter, indices, aabb)
 
     # debug print?
     def debugPrint(self):
@@ -143,6 +175,51 @@ class KDTreeNode:
             print(" -- Children: { %d, %d }" % (self.children[0]._id, self.children[1]._id))
             self.children[0].debugPrint()
             self.children[1].debugPrint()
+
+    # tighten aabb
+    def tightenAABB(self):
+        # for comparison
+        oldVolume = self.aabb.volume()
+        oldMin = list(self.aabb.min)
+        oldMax = list(self.aabb.max)
+        # use recursion
+        if not self.isLeaf():
+            # make sure child is tight
+            c1 = self.children[0]
+            c2 = self.children[1]
+            c1.tightenAABB()
+            c2.tightenAABB()
+            # now we recompute our aabb
+            # set to c1.aabb
+            self.aabb.min = list(c1.aabb.min)
+            self.aabb.max = list(c1.aabb.max)
+            # unionize c2.aabb
+            self.aabb.union(c2.aabb)
+        else:
+            # we're leaves, so recurse over our tri_bbox
+            for (idx, bbox) in enumerate(self.trisBBox):
+                if idx == 0:
+                    # first triangle, copy it
+                    self.aabb.min = list(bbox.min)
+                    self.aabb.max = list(bbox.max)
+                else:
+                    # now we unionize 
+                    self.aabb.union(bbox)
+        # print difference?
+        newVol = self.aabb.volume()
+        newMin = self.aabb.min
+        newMax = self.aabb.max
+        nodeType = ('Branch', 'Leaf')[self.isLeaf()]
+        if newVol != oldVolume:
+            print("(%s)_Node[%d] aabb change from (%.2f %.2f %.2f | %.2f %.2f %.2f) --> (%.2f %.2f %.2f | %.2f %.2f %.2f)" % (
+                nodeType, self._id, oldMin[0], oldMin[1], oldMin[2], oldMax[0], oldMax[1], oldMax[2],
+                newMin[0], newMin[1], newMin[2], newMax[0], newMax[1], newMax[2],
+            ))
+        else:
+            print("(%s)_Node[%d] aabb didn't change volume (%.2f %.2f %.2f | %.2f %.2f %.2f)" % (
+                nodeType, self._id, newMin[0], newMin[1], newMin[2], newMax[0], newMax[1], newMax[2]
+            ))
+
 
 # count nodes and renumber them
 def nodeCount(tree, renumber=True):
@@ -224,22 +301,36 @@ def buildTree(obj, maxDepth=10, maxTris=10000):
         t_idx = list(t.vertices)
         # compute centers
         t_center = [0, 0, 0]
+        # aabb
+        aabb = None
         for i in range(3):
             l = mesh.loops[t_idx[i]]
             v = mesh.vertices[l.vertex_index]
             t_center[0] += v.co[0]
             t_center[1] += -v.co[2]
             t_center[2] += v.co[1]
+            # compute pos
+            pos = [v.co[0], -v.co[2], v.co[1]]
+            # init aabb if it's teh first?
+            if not aabb:
+                aabb = AABB(pos)
+            else:
+                aabb.encase(pos)
         
         t_center[0] /= 3.0
         t_center[1] /= 3.0
         t_center[2] /= 3.0
 
         # now add em? ADD THE TRIANGLE DIRECTLY!!!!
-        root.addTriangle(t_center, t)
+        print("Tri[%d] aabb: %.2f %.2f %.2f | %.2f %.2f %.2f" % (idx, aabb.min[0], aabb.min[1], aabb.min[2], aabb.max[0], aabb.max[1], aabb.max[2]))
+        root.addTriangle(t_center, t, aabb)
 
     # return the root node, but renumber them first
+    print("Renumbering nodes...")
     nodeCount(root)
+    print("BVHTree built successfully.")
+    print("Tightening Bounding Boxes...")
+    root.tightenAABB()
     return root
 # 
 
@@ -378,12 +469,15 @@ def buildSingleMeshFromLeafNode(obj, node, format=VTF_DEFAULT):
 
 # build meshes from tree
 def buildMeshesFromTree(obj, tree, format=VTF_DEFAULT):
+    print("Building Meshes object from the tree...")
     leaves = collectGoodLeaves(tree)
     meshes = []
     for (idx, l) in enumerate(leaves):
+        print("building mesh[%d] : node(%d), tri_count(%d)..." % (idx, l._id, len(l.tris)))
         m = buildSingleMeshFromLeafNode(obj, l, format)
         meshes.append(m)
         l.object_id = idx
+    print("Meshes built.")
     return meshes
 
 ###
@@ -584,6 +678,7 @@ def can_write(context, vtx_format, me):
 
 # write tree in ascii format
 def write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format):
+    print("WRITING TO ASCII (%s)..." % (filepath))
     f = open(filepath, mode="w", encoding="utf-8")
 
     # first, write object name?
@@ -687,6 +782,7 @@ def write_tree_to_ascii(filepath, obj, tree, meshes, vtx_format):
 #  - [triangle_count x 3 x 2b]{ index_buffers }
 # }
 def write_tree_to_binary(filepath, obj, tree, meshes, vtx_format):
+    print("Writing to binary (%s)..." % (filepath))
     f = open(filepath, mode="wb")
 
     '''
